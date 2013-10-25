@@ -8,8 +8,20 @@
 
 #ifndef Dragon_MyNet_h
 #define Dragon_MyNet_h
+#include "cmdobject.h"
 #include "platfrom.h"
 #if PLATFORM == PLATFORM_UNIX
+#include "sys/socket.h"
+#include "sys/epoll.h"
+#include <sys/time.h>
+#include "sys/poll.h"
+#include "sys/select.h"
+#include "sys/types.h"
+#include <arpa/inet.h>
+#include "unistd.h"
+#include "netinet/in.h"
+#include "fcntl.h"
+#include "netdb.h"
 #include "zlib.h"
 #include <vector>
 #include <string>
@@ -27,6 +39,12 @@ namespace mynet{
     public:
         Record(void *cmd,unsigned int len)
         {
+	    if (len >= 60000)
+	    {
+		printf("len >= 60000\n");
+		contents = NULL;
+		 return;
+	 	}
             contents = new unsigned char[len];
             memcpy(contents,cmd,len);
             contentSize = len;
@@ -61,6 +79,7 @@ namespace mynet{
             unsigned int leftSize = leftsize();
             if ( 0 == leftSize) return true;
             int sendLen = connection->send(contents + offset,leftSize);
+	    if (sendLen == -1) return false;
             offset += sendLen;
             if (sendLen < leftSize) return false;
             return true;
@@ -68,6 +87,7 @@ namespace mynet{
         unsigned int offset;
         bool empty()
         {
+	    if (!contents) return true;
             return offset == contentSize;
         }
         unsigned int contentSize;
@@ -147,8 +167,9 @@ namespace mynet{
     /**
      * *************************解码处理函数*****************************************
      */
+    class Target;
     struct stGetPackage{
-        virtual void doGetCommand(void *cmd,unsigned int len) = 0;
+        virtual void doGetCommand(Target *target,void *cmd,unsigned int len) = 0;
     };
     /**
      * 解码器
@@ -161,14 +182,14 @@ namespace mynet{
             tag = 0;
         }
     private:
-        unsigned int currentoffset; // ÂΩìÂâçÊï∞ÊçÆËµ∑ÂßãÁÇ?
+        unsigned int currentoffset; // 
         std::vector<unsigned char> contents;
         
         enum{
-            START,
-            END,
-            PICK_HEAD,
-            PICK_BODY,
+            START = 0,
+            END = 1,
+            PICK_HEAD =2 ,
+            PICK_BODY = 3,
         };
         
         unsigned char nowstate; //
@@ -196,69 +217,32 @@ namespace mynet{
             currentoffset += ret;
             return true;
         }
-        void refresh();
-        template<typename Record>
-        bool run(Record *record)
-        {
-            if ( currentoffset == contents.size())
-            {
-                refresh();
-                return pickdata(record) || isFinished();
-            }
-            return pickdata(record);
-        }
-        bool isFinished();
-        void setbodysize(unsigned int size);
-        unsigned int getbodysize();
+        virtual void setbodysize(unsigned int size);
+        virtual unsigned int getbodysize();
     public:
-        template<typename Record>
-        unsigned int decode(Record * target,void *buffer,unsigned int maxSize) // Ëß£Á†ÅÂô?
-        {
-            while(run(target))
-            {
-                if (isFinished())
-                {
-                    undes();
-                    unsigned int retSize = unzip((unsigned char*)buffer,maxSize,0);
-                    return retSize;
-                }
-            }
-            return 0;
-        }
-        template<typename Record>
-        void decode(Record *target,stGetPackage *callback) // Ëß£Á†ÅÂô?
-        {
-            while(run(target))
-            {
-                if (isFinished())
-                {
-                    undes();
-                    if (tag & ZIP)
-                    {
-                        unsigned char buffer[MAX_DATASIZE]={'\0'};
-                        unsigned int retSize = unzip(buffer,MAX_DATASIZE,0);
-                        if (callback)
-                            callback->doGetCommand(buffer,retSize);
-                    }
-                    else if (contents.size())
-                    {
-                        if (callback)
-                            callback->doGetCommand(&contents[0],contents.size());
-                    }
-                }
-            }
-        }
+		/**
+		 & 处理变头报文解码
+		 */
+		virtual void decode(Record *record,Target *target,stGetPackage *callback);
         Record * getRecord();
-        void encode(void *data,unsigned int len,bool ziptag = false,bool destag = false);
+        virtual void encode(void *data,unsigned int len,bool ziptag = false,bool destag = false);
     private:
         unsigned int unzip_size(unsigned int zip_size);
-        unsigned int unzip(unsigned char *buffer,unsigned int len,unsigned int offset);
+        int unzip(unsigned char *buffer,unsigned int len,unsigned int offset);
         
         void undes();
         unsigned int zip(void *data,unsigned int len,unsigned int offset);
 		
         void des();
     };
+	class ztDecoder:public Decoder{
+	public:
+		virtual void setbodysize(unsigned int size);
+        virtual unsigned int getbodysize();
+		static const unsigned int HEAD_LEN = 32;
+		virtual void decode(Record *record,Target *target,stGetPackage *callback);
+		virtual void encode(void *data,unsigned int len,bool ziptag = false,bool destag = false);
+	};
     /**
      * *****************************消息转发器***********************************
      * obj.req({reqId=1,retId=2,data={content="hello,world"}},function(jsondata)
@@ -376,10 +360,6 @@ namespace mynet{
 			return (TARGET*)target;
 		}
 	};
-	struct _epoll_event{
-		int u;
-		long l;
-	};
 	class EventPool{
 	public:
 		EventPool()
@@ -387,17 +367,17 @@ namespace mynet{
 		}
 		void init();
 		void bindEvent(Target *target,int eventType);
-		std::vector<struct _epoll_event> eventBuffer;
+		std::vector<struct epoll_event> eventBuffer;
 		int poolHandle;
 		EventBase *pullEvent();
 	};
 	// NET
-	class Connection:public pool::Target,public stGetPackage{
+	class Connection:public Target,public stGetPackage{
 	 public:
 		std::string peerIp;
 		unsigned short peerPort;
 		virtual bool destroy();
-		virtual void doGetCommand(void *cmd,unsigned int len){}
+		virtual void doGetCommand(Target *target,void *cmd,unsigned int len){}
 		Connection()
 		{
 			peerPort = 0;
@@ -411,8 +391,7 @@ namespace mynet{
 		template<class CmdObject>
 		void sendObject(CmdObject *object)
 		{
-			cmd::Stream ss;
-			object->toStream(ss);
+			cmd::Stream ss = object->toStream();
 			if (ss.size())
 			{
 			Decoder decoder;
@@ -432,27 +411,23 @@ namespace mynet{
 		/** 
 		* 
 		*/
-		unsigned int getCmd(void *cmd,unsigned int len)
-		{
-			return decoder.decode(this,cmd,len);
-		}
 		/**
 		* 
 		**/
 		unsigned int recv(void *cmd,unsigned int size);
-		char buffer[pool::EventBase::MAX_BUFFER_LEN];
-		virtual void doReadBuffer(pool::EventBase *evt,stGetPackage *callback = NULL);
-
+		char buffer[EventBase::MAX_BUFFER_LEN];
+		virtual void doReadBuffer(EventBase *evt,stGetPackage *callback = NULL);
+		void logToFile(void *cmd,unsigned leftLen);
 		/**
 		**/
-		virtual void doRead(pool::EventBase *evt,stGetPackage *callback = NULL);
+		virtual void doRead(EventBase *evt,stGetPackage *callback = NULL);
 		void httpGet(const std::string &url)
 		{
 		}
 		/**
 		* ÔÚpool ÖÐ´¦Àí·¢ËÍ
 		**/
-		virtual void doSend(pool::EventBase *evt);
+		virtual void doSend(EventBase *evt);
 		int  socket;
 		// std::list<Record*> recvs;
 		MyList<Record*> recvs;
@@ -472,7 +447,7 @@ namespace mynet{
 		 void setnonblock(int socket);
  		virtual bool destroy();
 	 };
-	 class Server:public pool::Target{
+	 class Server:public Target{
 	 public:
 		Server(const char *ip,unsigned short port)
 		{
